@@ -65,6 +65,9 @@ func main() {
 		tryVLESS         bool
 		probeDest        string
 		probeHostHeader  string
+		botMode          bool
+		telegramToken    string
+		maxConfigs       int
 	)
 
 	flag.StringVar(&configURL, "config", "", "VLESS URL, e.g. vless://uuid@host:443?...")
@@ -77,13 +80,10 @@ func main() {
 	flag.BoolVar(&tryVLESS, "vless-handshake", true, "attempt real VLESS handshake and proxy probe")
 	flag.StringVar(&probeDest, "probe-dest", "connectivitycheck.gstatic.com:80", "destination host:port for VLESS proxy probe")
 	flag.StringVar(&probeHostHeader, "probe-host", "connectivitycheck.gstatic.com", "host header for HTTP probe over VLESS")
+	flag.BoolVar(&botMode, "bot", false, "run as Telegram bot mode")
+	flag.StringVar(&telegramToken, "telegram-token", "", "Telegram bot token (or env TELEGRAM_BOT_TOKEN)")
+	flag.IntVar(&maxConfigs, "max-configs", 25, "max configs to check from one message")
 	flag.Parse()
-
-	if configURL == "" {
-		fmt.Fprintln(os.Stderr, "Ошибка: передайте VLESS-ссылку через --config")
-		flag.Usage()
-		os.Exit(2)
-	}
 
 	checkCfg := CheckConfig{
 		Timeout:         time.Duration(timeoutSec) * time.Second,
@@ -95,6 +95,30 @@ func main() {
 		TryVLESSHandshake: tryVLESS,
 		ProbeDest:         probeDest,
 		ProbeHostHeader:   probeHostHeader,
+	}
+
+	if botMode {
+		if telegramToken == "" {
+			telegramToken = os.Getenv("TELEGRAM_BOT_TOKEN")
+		}
+		if telegramToken == "" {
+			fmt.Fprintln(os.Stderr, "Ошибка: в режиме --bot нужен --telegram-token или переменная TELEGRAM_BOT_TOKEN")
+			os.Exit(2)
+		}
+		if maxConfigs < 1 {
+			maxConfigs = 1
+		}
+		if err := RunTelegramBot(telegramToken, checkCfg, maxConfigs); err != nil {
+			fmt.Fprintf(os.Stderr, "Ошибка запуска бота: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if configURL == "" {
+		fmt.Fprintln(os.Stderr, "Ошибка: передайте VLESS-ссылку через --config или используйте --bot")
+		flag.Usage()
+		os.Exit(2)
 	}
 
 	results, parsedCfg := RunChecks(configURL, checkCfg)
