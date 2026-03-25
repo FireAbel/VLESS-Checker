@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -47,10 +49,106 @@ type tgFileInfo struct {
 	FilePath string `json:"file_path"`
 }
 
-func RunTelegramBot(token string, checkCfg CheckConfig, maxConfigs int) error {
+type BotConfig struct {
+	MaxConfigs   int
+	Workers      int
+	BatchTimeout time.Duration
+	UserRPM      int
+	GlobalRPM    int
+}
+
+type tokenBucket struct {
+	mu        sync.Mutex
+	capacity  float64
+	tokens    float64
+	refillPer float64 // tokens per second
+	last      time.Time
+}
+
+func newTokenBucket(perMinute int, burst int) *tokenBucket {
+	if perMinute < 1 {
+		perMinute = 1
+	}
+	if burst < 1 {
+		burst = 1
+	}
+	return &tokenBucket{
+		capacity:  float64(burst),
+		tokens:    float64(burst),
+		refillPer: float64(perMinute) / 60.0,
+		last:      time.Now(),
+	}
+}
+
+func (b *tokenBucket) allowN(n int) bool {
+	if n <= 0 {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	now := time.Now()
+	elapsed := now.Sub(b.last).Seconds()
+	if elapsed > 0 {
+		b.tokens += elapsed * b.refillPer
+		if b.tokens > b.capacity {
+			b.tokens = b.capacity
+		}
+		b.last = now
+	}
+
+	need := float64(n)
+	if b.tokens >= need {
+		b.tokens -= need
+		return true
+	}
+	return false
+}
+
+type botLimits struct {
+	global  *tokenBucket
+	perUser map[int64]*tokenBucket
+	mu      sync.Mutex
+}
+
+func newBotLimits(userRPM, globalRPM int) *botLimits {
+	return &botLimits{
+		global:  newTokenBucket(globalRPM, globalRPM),
+		perUser: map[int64]*tokenBucket{},
+	}
+}
+
+func (l *botLimits) allow(chatID int64, checks int, userRPM int) bool {
+	if !l.global.allowN(checks) {
+		return false
+	}
+	l.mu.Lock()
+	tb := l.perUser[chatID]
+	if tb == nil {
+		tb = newTokenBucket(userRPM, userRPM)
+		l.perUser[chatID] = tb
+	}
+	l.mu.Unlock()
+	return tb.allowN(checks)
+}
+
+type tgSendMessageResp struct {
+	OK     bool            `json:"ok"`
+	Result tgSendMsgResult `json:"result"`
+}
+
+type tgSendMsgResult struct {
+	MessageID int `json:"message_id"`
+	Chat      tgChat
+	Text      string `json:"text"`
+}
+
+func RunTelegramBot(token string, checkCfg CheckConfig, cfg BotConfig) error {
 	base := "https://api.telegram.org/bot" + token
 	offset := 0
 	client := &http.Client{Timeout: 30 * time.Second}
+	limits := newBotLimits(cfg.UserRPM, cfg.GlobalRPM)
+	batchSem := make(chan struct{}, 3) // limit parallel batches to avoid overload
 
 	fmt.Println("Telegram bot started. Waiting for messages...")
 	for {
@@ -67,7 +165,7 @@ func RunTelegramBot(token string, checkCfg CheckConfig, maxConfigs int) error {
 			if up.Message.Chat.ID == 0 {
 				continue
 			}
-			if err := handleUpdate(client, token, base, up, checkCfg, maxConfigs); err != nil {
+			if err := handleUpdate(client, token, base, up, checkCfg, cfg, limits, batchSem); err != nil {
 				_ = sendTelegramMessage(client, base, up.Message.Chat.ID, "Ошибка обработки: "+err.Error())
 			}
 		}
@@ -95,7 +193,7 @@ func getTelegramUpdates(client *http.Client, base string, offset int) ([]tgUpdat
 	return decoded.Result, nil
 }
 
-func handleUpdate(client *http.Client, token, base string, up tgUpdate, checkCfg CheckConfig, maxConfigs int) error {
+func handleUpdate(client *http.Client, token, base string, up tgUpdate, checkCfg CheckConfig, cfg BotConfig, limits *botLimits, batchSem chan struct{}) error {
 	chatID := up.Message.Chat.ID
 	rawInput := strings.TrimSpace(up.Message.Text)
 	if rawInput == "" {
@@ -120,42 +218,162 @@ func handleUpdate(client *http.Client, token, base string, up tgUpdate, checkCfg
 	if len(configs) == 0 {
 		return sendTelegramMessage(client, base, chatID, "VLESS конфиги не найдены. Проверьте формат входных данных.")
 	}
-	if len(configs) > maxConfigs {
-		configs = configs[:maxConfigs]
+	if len(configs) > cfg.MaxConfigs {
+		configs = configs[:cfg.MaxConfigs]
 	}
 
-	_ = sendTelegramMessage(client, base, chatID, fmt.Sprintf("Найдено %d конфиг(ов). Запускаю проверку...", len(configs)))
-	report := buildConfigsReport(configs, checkCfg)
+	if !limits.allow(chatID, len(configs), cfg.UserRPM) {
+		return sendTelegramMessage(client, base, chatID, "Слишком много проверок. Подождите немного и попробуйте снова.")
+	}
+
+	batchSem <- struct{}{}
+	defer func() { <-batchSem }()
+
+	progressMsgID, err := sendTelegramMessageWithID(client, base, chatID, renderProgress(0, len(configs), "старт"))
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.BatchTimeout)
+	defer cancel()
+
+	report, completed := buildConfigsReportParallel(ctx, configs, checkCfg, cfg.Workers, func(done int, total int, note string) {
+		_ = editTelegramMessage(client, base, chatID, progressMsgID, renderProgress(done, total, note))
+	})
+
+	if !completed {
+		report = "⚠️ Таймаут проверки пакета (30s). Отправляю частичный результат.\n\n" + report
+	}
+	_ = editTelegramMessage(client, base, chatID, progressMsgID, "Проверка завершена. Отправляю отчет…")
 	return sendTelegramMessage(client, base, chatID, report)
 }
 
-func buildConfigsReport(configs []string, checkCfg CheckConfig) string {
-	lines := make([]string, 0, len(configs)+2)
-	okCount := 0
-	for i, cfgURL := range configs {
-		results, parsed := RunChecks(cfgURL, checkCfg)
-		fail := firstFailure(results)
-		target := cfgURL
-		if parsed != nil {
-			target = fmt.Sprintf("%s:%s (%s)", parsed.Host, parsed.Port, parsed.Type)
+type cfgResult struct {
+	Idx    int
+	Target string
+	OK     bool
+	Stage  string
+	Reason string
+}
+
+func buildConfigsReportParallel(ctx context.Context, configs []string, checkCfg CheckConfig, workers int, onProgress func(done int, total int, note string)) (report string, completed bool) {
+	if workers < 1 {
+		workers = 1
+	}
+	jobs := make(chan struct {
+		idx int
+		url string
+	})
+	resultsCh := make(chan cfgResult, len(configs))
+
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				res := checkOneConfig(ctx, job.idx, job.url, checkCfg)
+				select {
+				case resultsCh <- res:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	go func() {
+		defer close(resultsCh)
+		wg.Wait()
+	}()
+
+	go func() {
+		defer close(jobs)
+		for i, u := range configs {
+			select {
+			case <-ctx.Done():
+				return
+			case jobs <- struct {
+				idx int
+				url string
+			}{idx: i, url: u}:
+			}
 		}
-		if fail == nil {
+	}()
+
+	collected := make([]cfgResult, 0, len(configs))
+	done := 0
+	lastEdit := time.Now().Add(-10 * time.Second)
+
+	for {
+		select {
+		case <-ctx.Done():
+			// drain any ready results quickly
+			for {
+				select {
+				case r, ok := <-resultsCh:
+					if !ok {
+						goto BUILD
+					}
+					collected = append(collected, r)
+					done++
+				default:
+					goto BUILD
+				}
+			}
+		case r, ok := <-resultsCh:
+			if !ok {
+				goto BUILD
+			}
+			collected = append(collected, r)
+			done++
+			if onProgress != nil && (time.Since(lastEdit) > 1*time.Second || done == len(configs)) {
+				lastEdit = time.Now()
+				onProgress(done, len(configs), "проверяю")
+			}
+		}
+	}
+
+BUILD:
+	sort.Slice(collected, func(i, j int) bool { return collected[i].Idx < collected[j].Idx })
+	lines := make([]string, 0, len(collected)*2+2)
+	okCount := 0
+	for _, r := range collected {
+		if r.OK {
 			okCount++
-			lines = append(lines, fmt.Sprintf("%d) ✅ WORKS — %s", i+1, target))
+			lines = append(lines, fmt.Sprintf("%d) ✅ WORKS — %s", r.Idx+1, r.Target))
 			continue
 		}
-		reason := shortReason(fail.Err)
-		if reason == "" {
-			reason = shortReasonText(fail.Detail)
-		}
-		if reason == "" {
-			reason = "неизвестная причина"
-		}
-		lines = append(lines, fmt.Sprintf("%d) ❌ FAIL — %s", i+1, target))
-		lines = append(lines, fmt.Sprintf("   этап: %s; причина: %s", fail.Name, reason))
+		lines = append(lines, fmt.Sprintf("%d) ❌ FAIL — %s", r.Idx+1, r.Target))
+		lines = append(lines, fmt.Sprintf("   этап: %s; причина: %s", r.Stage, r.Reason))
 	}
-	header := fmt.Sprintf("Итог: %d/%d работает.", okCount, len(configs))
-	return ensureTelegramLimit(header + "\n\n" + strings.Join(lines, "\n"))
+	header := fmt.Sprintf("Итог: %d/%d работает. Проверено %d/%d.", okCount, len(collected), len(collected), len(configs))
+	return ensureTelegramLimit(header + "\n\n" + strings.Join(lines, "\n")), len(collected) == len(configs)
+}
+
+func checkOneConfig(ctx context.Context, idx int, cfgURL string, checkCfg CheckConfig) cfgResult {
+	results, parsed := RunChecksCtx(ctx, cfgURL, checkCfg)
+	fail := firstFailure(results)
+	target := cfgURL
+	if parsed != nil {
+		target = fmt.Sprintf("%s:%s (%s)", parsed.Host, parsed.Port, parsed.Type)
+	}
+	if fail == nil {
+		return cfgResult{Idx: idx, Target: target, OK: true}
+	}
+	reason := shortReason(fail.Err)
+	if reason == "" {
+		reason = shortReasonText(fail.Detail)
+	}
+	if reason == "" {
+		reason = "неизвестная причина"
+	}
+	return cfgResult{Idx: idx, Target: target, OK: false, Stage: fail.Name, Reason: reason}
 }
 
 func shortReason(err error) string {
@@ -297,6 +515,11 @@ func downloadTelegramFileText(client *http.Client, token, fileID string) (string
 }
 
 func sendTelegramMessage(client *http.Client, base string, chatID int64, text string) error {
+	_, err := sendTelegramMessageWithID(client, base, chatID, text)
+	return err
+}
+
+func sendTelegramMessageWithID(client *http.Client, base string, chatID int64, text string) (int, error) {
 	form := url.Values{}
 	form.Set("chat_id", fmt.Sprintf("%d", chatID))
 	form.Set("text", text)
@@ -304,12 +527,38 @@ func sendTelegramMessage(client *http.Client, base string, chatID int64, text st
 
 	resp, err := client.PostForm(base+"/sendMessage", form)
 	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
+		return 0, fmt.Errorf("sendMessage status=%d body=%s", resp.StatusCode, string(b))
+	}
+	var decoded tgSendMessageResp
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		return 0, err
+	}
+	if !decoded.OK {
+		return 0, fmt.Errorf("sendMessage ok=false")
+	}
+	return decoded.Result.MessageID, nil
+}
+
+func editTelegramMessage(client *http.Client, base string, chatID int64, messageID int, text string) error {
+	form := url.Values{}
+	form.Set("chat_id", fmt.Sprintf("%d", chatID))
+	form.Set("message_id", fmt.Sprintf("%d", messageID))
+	form.Set("text", text)
+	form.Set("disable_web_page_preview", "true")
+
+	resp, err := client.PostForm(base+"/editMessageText", form)
+	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 2048))
-		return fmt.Errorf("sendMessage status=%d body=%s", resp.StatusCode, string(b))
+		return fmt.Errorf("editMessageText status=%d body=%s", resp.StatusCode, string(b))
 	}
 	return nil
 }
@@ -320,4 +569,20 @@ func ensureTelegramLimit(s string) string {
 		return s
 	}
 	return s[:maxLen] + "\n... (report truncated)"
+}
+
+func renderProgress(done, total int, note string) string {
+	if total <= 0 {
+		total = 1
+	}
+	width := 16
+	filled := int(float64(done) / float64(total) * float64(width))
+	if filled < 0 {
+		filled = 0
+	}
+	if filled > width {
+		filled = width
+	}
+	bar := "[" + strings.Repeat("█", filled) + strings.Repeat("░", width-filled) + "]"
+	return fmt.Sprintf("%s %d/%d (%s)", bar, done, total, note)
 }

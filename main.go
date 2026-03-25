@@ -68,6 +68,10 @@ func main() {
 		botMode          bool
 		telegramToken    string
 		maxConfigs       int
+		workers          int
+		botTimeoutSec    int
+		userRPM          int
+		globalRPM        int
 	)
 
 	flag.StringVar(&configURL, "config", "", "VLESS URL, e.g. vless://uuid@host:443?...")
@@ -83,6 +87,10 @@ func main() {
 	flag.BoolVar(&botMode, "bot", false, "run as Telegram bot mode")
 	flag.StringVar(&telegramToken, "telegram-token", "", "Telegram bot token (or env TELEGRAM_BOT_TOKEN)")
 	flag.IntVar(&maxConfigs, "max-configs", 25, "max configs to check from one message")
+	flag.IntVar(&workers, "workers", 8, "number of parallel workers for bot checks (5-10 recommended)")
+	flag.IntVar(&botTimeoutSec, "bot-timeout", 30, "overall timeout in seconds for one dynamic config batch")
+	flag.IntVar(&userRPM, "user-rpm", 60, "rate limit per user (checks per minute)")
+	flag.IntVar(&globalRPM, "global-rpm", 300, "global rate limit (checks per minute)")
 	flag.Parse()
 
 	checkCfg := CheckConfig{
@@ -108,7 +116,31 @@ func main() {
 		if maxConfigs < 1 {
 			maxConfigs = 1
 		}
-		if err := RunTelegramBot(telegramToken, checkCfg, maxConfigs); err != nil {
+		if workers < 1 {
+			workers = 1
+		}
+		if workers < 5 {
+			workers = 5
+		}
+		if workers > 10 {
+			workers = 10
+		}
+		if botTimeoutSec < 5 {
+			botTimeoutSec = 5
+		}
+		if userRPM < 1 {
+			userRPM = 1
+		}
+		if globalRPM < 1 {
+			globalRPM = 1
+		}
+		if err := RunTelegramBot(telegramToken, checkCfg, BotConfig{
+			MaxConfigs:   maxConfigs,
+			Workers:      workers,
+			BatchTimeout: time.Duration(botTimeoutSec) * time.Second,
+			UserRPM:      userRPM,
+			GlobalRPM:    globalRPM,
+		}); err != nil {
 			fmt.Fprintf(os.Stderr, "Ошибка запуска бота: %v\n", err)
 			os.Exit(1)
 		}
@@ -130,6 +162,10 @@ func main() {
 }
 
 func RunChecks(raw string, cfg CheckConfig) ([]StageResult, *VLESSConfig) {
+	return RunChecksCtx(context.Background(), raw, cfg)
+}
+
+func RunChecksCtx(ctx context.Context, raw string, cfg CheckConfig) ([]StageResult, *VLESSConfig) {
 	results := make([]StageResult, 0, 10)
 
 	start := time.Now()
@@ -148,7 +184,7 @@ func RunChecks(raw string, cfg CheckConfig) ([]StageResult, *VLESSConfig) {
 	}
 
 	start = time.Now()
-	resolvedIPs, err := resolveHost(parsed.Host, cfg.Timeout)
+	resolvedIPs, err := resolveHost(ctx, parsed.Host, cfg.Timeout)
 	detail := fmt.Sprintf("host=%s ips=%s", parsed.Host, strings.Join(resolvedIPs, ","))
 	results = append(results, stageFrom("dns_resolve", start, err == nil, detail, err))
 	if err != nil {
@@ -157,7 +193,7 @@ func RunChecks(raw string, cfg CheckConfig) ([]StageResult, *VLESSConfig) {
 
 	address := net.JoinHostPort(parsed.Host, parsed.Port)
 	start = time.Now()
-	conn, err := dialTCP(address, cfg.Timeout)
+	conn, err := dialTCP(ctx, address, cfg.Timeout)
 	results = append(results, stageFrom("tcp_connect", start, err == nil, address, err))
 	if err != nil {
 		return results, parsed
@@ -175,7 +211,7 @@ func RunChecks(raw string, cfg CheckConfig) ([]StageResult, *VLESSConfig) {
 		}
 
 		start = time.Now()
-		tlsState, tlsErr := checkTLS(address, serverName, cfg.Timeout, cfg.SkipTLSVerify)
+		tlsState, tlsErr := checkTLS(ctx, address, serverName, cfg.Timeout, cfg.SkipTLSVerify)
 		results = append(results, stageFrom("tls_handshake", start, tlsErr == nil, tlsState, tlsErr))
 		if tlsErr != nil {
 			return results, parsed
@@ -185,17 +221,17 @@ func RunChecks(raw string, cfg CheckConfig) ([]StageResult, *VLESSConfig) {
 	shouldTryWS := cfg.TryWSUpgrade && (strings.EqualFold(parsed.Type, "ws") || (parsed.Type == "" && cfg.PreferWebsocket))
 	if shouldTryWS {
 		start = time.Now()
-		wsDetail, wsErr := probeWebSocket(parsed, cfg)
+		wsDetail, wsErr := probeWebSocket(ctx, parsed, cfg)
 		results = append(results, stageFrom("ws_upgrade_probe", start, wsErr == nil, wsDetail, wsErr))
 	}
 
 	if cfg.TryVLESSHandshake {
 		start = time.Now()
-		hsDetail, hsErr := probeVLESSHandshake(parsed, cfg)
+		hsDetail, hsErr := probeVLESSHandshake(ctx, parsed, cfg)
 		results = append(results, stageFrom("vless_handshake", start, hsErr == nil, hsDetail, hsErr))
 		if hsErr == nil {
 			start = time.Now()
-			postDetail, postErr := checkPostHandshakeBehavior(parsed, cfg)
+			postDetail, postErr := checkPostHandshakeBehavior(ctx, parsed, cfg)
 			results = append(results, stageFrom("post_handshake_behavior", start, postErr == nil, postDetail, postErr))
 		}
 	}
@@ -234,8 +270,8 @@ func ParseVLESS(raw string) (*VLESSConfig, error) {
 	return cfg, nil
 }
 
-func resolveHost(host string, timeout time.Duration) ([]string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+func resolveHost(ctx context.Context, host string, timeout time.Duration) ([]string, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	ips, err := net.DefaultResolver.LookupHost(ctx, host)
@@ -245,29 +281,40 @@ func resolveHost(host string, timeout time.Duration) ([]string, error) {
 	return ips, nil
 }
 
-func dialTCP(address string, timeout time.Duration) (net.Conn, error) {
-	d := net.Dialer{Timeout: timeout}
-	return d.Dial("tcp", address)
+func dialTCP(ctx context.Context, address string, timeout time.Duration) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	d := net.Dialer{}
+	return d.DialContext(ctx, "tcp", address)
 }
 
-func checkTLS(address, serverName string, timeout time.Duration, skipVerify bool) (string, error) {
-	d := &net.Dialer{Timeout: timeout}
-	conn, err := tls.DialWithDialer(d, "tcp", address, &tls.Config{
+func checkTLS(ctx context.Context, address, serverName string, timeout time.Duration, skipVerify bool) (string, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	d := &net.Dialer{}
+	rawConn, err := d.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return "", err
+	}
+
+	tlsConn := tls.Client(rawConn, &tls.Config{
 		ServerName:         serverName,
 		InsecureSkipVerify: skipVerify,
 		MinVersion:         tls.VersionTLS12,
 	})
-	if err != nil {
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		_ = rawConn.Close()
 		return "", err
 	}
-	defer conn.Close()
+	defer tlsConn.Close()
 
-	state := conn.ConnectionState()
+	state := tlsConn.ConnectionState()
 	return fmt.Sprintf("version=%s cipher=%s sni=%s",
 		tlsVersionName(state.Version), tls.CipherSuiteName(state.CipherSuite), serverName), nil
 }
 
-func probeWebSocket(cfg *VLESSConfig, checkCfg CheckConfig) (string, error) {
+func probeWebSocket(ctx context.Context, cfg *VLESSConfig, checkCfg CheckConfig) (string, error) {
 	scheme := "http"
 	if strings.EqualFold(cfg.Security, "tls") || strings.EqualFold(cfg.Security, "reality") {
 		scheme = "https"
@@ -282,7 +329,7 @@ func probeWebSocket(cfg *VLESSConfig, checkCfg CheckConfig) (string, error) {
 	}
 
 	targetURL := fmt.Sprintf("%s://%s%s", scheme, net.JoinHostPort(cfg.Host, cfg.Port), wsPath)
-	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, targetURL, nil)
 	if err != nil {
 		return "", err
 	}
@@ -321,11 +368,11 @@ func probeWebSocket(cfg *VLESSConfig, checkCfg CheckConfig) (string, error) {
 		fmt.Errorf("ожидался HTTP 101 для WS Upgrade, получено %d", resp.StatusCode)
 }
 
-func probeVLESSHandshake(cfg *VLESSConfig, checkCfg CheckConfig) (string, error) {
+func probeVLESSHandshake(ctx context.Context, cfg *VLESSConfig, checkCfg CheckConfig) (string, error) {
 	dests := parseProbeDests(checkCfg.ProbeDest)
 	var errs []string
 	for _, dest := range dests {
-		detail, err := probeVLESSHandshakeOnce(cfg, checkCfg, dest)
+		detail, err := probeVLESSHandshakeOnce(ctx, cfg, checkCfg, dest)
 		if err == nil {
 			return detail, nil
 		}
@@ -334,8 +381,8 @@ func probeVLESSHandshake(cfg *VLESSConfig, checkCfg CheckConfig) (string, error)
 	return "", fmt.Errorf("VLESS handshake не прошел ни на одном --probe-dest: %s", strings.Join(errs, " | "))
 }
 
-func probeVLESSHandshakeOnce(cfg *VLESSConfig, checkCfg CheckConfig, probeDest string) (string, error) {
-	conn, transportDetail, err := dialVLESSTransport(cfg, checkCfg)
+func probeVLESSHandshakeOnce(ctx context.Context, cfg *VLESSConfig, checkCfg CheckConfig, probeDest string) (string, error) {
+	conn, transportDetail, err := dialVLESSTransport(ctx, cfg, checkCfg)
 	if err != nil {
 		return "", err
 	}
@@ -353,7 +400,7 @@ func probeVLESSHandshakeOnce(cfg *VLESSConfig, checkCfg CheckConfig, probeDest s
 		if err := wsWriteFrame(conn, 0x2, append(req, payload...)); err != nil {
 			return transportDetail, fmt.Errorf("не удалось отправить VLESS через WS: %w", err)
 		}
-		serverData, err := wsReadFramePayload(conn, checkCfg.Timeout)
+		serverData, err := wsReadFramePayload(ctx, conn, checkCfg.Timeout)
 		if err != nil {
 			return transportDetail, fmt.Errorf("не удалось прочитать WS frame с ответом: %w", err)
 		}
@@ -367,7 +414,7 @@ func probeVLESSHandshakeOnce(cfg *VLESSConfig, checkCfg CheckConfig, probeDest s
 		return fmt.Sprintf("%s probe_dest=%s vless_ok=true ws_payload=%dB proxied_data=%dB", transportDetail, probeDest, len(serverData), len(respData)), nil
 	}
 
-	_ = conn.SetDeadline(time.Now().Add(checkCfg.Timeout))
+	_ = setDeadlineFromContext(conn, ctx, checkCfg.Timeout)
 	if _, err := conn.Write(append(req, payload...)); err != nil {
 		return transportDetail, fmt.Errorf("не удалось отправить VLESS request: %w", err)
 	}
@@ -398,11 +445,11 @@ func probeVLESSHandshakeOnce(cfg *VLESSConfig, checkCfg CheckConfig, probeDest s
 	return fmt.Sprintf("%s probe_dest=%s vless_ok=true proxied_data=%dB", transportDetail, probeDest, n), nil
 }
 
-func checkPostHandshakeBehavior(cfg *VLESSConfig, checkCfg CheckConfig) (string, error) {
+func checkPostHandshakeBehavior(ctx context.Context, cfg *VLESSConfig, checkCfg CheckConfig) (string, error) {
 	dests := parseProbeDests(checkCfg.ProbeDest)
 	var errs []string
 	for _, dest := range dests {
-		detail, err := checkPostHandshakeBehaviorOnce(cfg, checkCfg, dest)
+		detail, err := checkPostHandshakeBehaviorOnce(ctx, cfg, checkCfg, dest)
 		if err == nil {
 			return detail, nil
 		}
@@ -411,8 +458,8 @@ func checkPostHandshakeBehavior(cfg *VLESSConfig, checkCfg CheckConfig) (string,
 	return "", fmt.Errorf("post-handshake поведение не подтверждено ни на одном --probe-dest: %s", strings.Join(errs, " | "))
 }
 
-func checkPostHandshakeBehaviorOnce(cfg *VLESSConfig, checkCfg CheckConfig, probeDest string) (string, error) {
-	conn, transportDetail, err := dialVLESSTransport(cfg, checkCfg)
+func checkPostHandshakeBehaviorOnce(ctx context.Context, cfg *VLESSConfig, checkCfg CheckConfig, probeDest string) (string, error) {
+	conn, transportDetail, err := dialVLESSTransport(ctx, cfg, checkCfg)
 	if err != nil {
 		return "", err
 	}
@@ -428,17 +475,17 @@ func checkPostHandshakeBehaviorOnce(cfg *VLESSConfig, checkCfg CheckConfig, prob
 		if err := wsWriteFrame(conn, 0x2, req); err != nil {
 			return transportDetail, fmt.Errorf("не удалось отправить VLESS handshake через WS: %w", err)
 		}
-		serverData, err := wsReadFramePayload(conn, checkCfg.Timeout)
+		serverData, err := wsReadFramePayload(ctx, conn, checkCfg.Timeout)
 		if err != nil {
 			return transportDetail, fmt.Errorf("не удалось прочитать WS frame с VLESS ответом: %w", err)
 		}
 		if _, err := parseVLESSResponse(serverData); err != nil {
 			return transportDetail, err
 		}
-		return assessServerBehaviorWS(conn, fmt.Sprintf("%s probe_dest=%s", transportDetail, probeDest), behaviorProbeTimeout(checkCfg.Timeout))
+		return assessServerBehaviorWS(ctx, conn, fmt.Sprintf("%s probe_dest=%s", transportDetail, probeDest), behaviorProbeTimeout(checkCfg.Timeout))
 	}
 
-	_ = conn.SetDeadline(time.Now().Add(checkCfg.Timeout))
+	_ = setDeadlineFromContext(conn, ctx, checkCfg.Timeout)
 	if _, err := conn.Write(req); err != nil {
 		return transportDetail, fmt.Errorf("не удалось отправить VLESS handshake: %w", err)
 	}
@@ -457,7 +504,7 @@ func checkPostHandshakeBehaviorOnce(cfg *VLESSConfig, checkCfg CheckConfig, prob
 			return transportDetail, fmt.Errorf("не удалось прочитать addons в VLESS ответе: %w", err)
 		}
 	}
-	return assessServerBehaviorRaw(conn, fmt.Sprintf("%s probe_dest=%s", transportDetail, probeDest), behaviorProbeTimeout(checkCfg.Timeout))
+	return assessServerBehaviorRaw(ctx, conn, fmt.Sprintf("%s probe_dest=%s", transportDetail, probeDest), behaviorProbeTimeout(checkCfg.Timeout))
 }
 
 func behaviorProbeTimeout(stageTimeout time.Duration) time.Duration {
@@ -474,8 +521,8 @@ func behaviorProbeTimeout(stageTimeout time.Duration) time.Duration {
 	return t
 }
 
-func assessServerBehaviorRaw(conn net.Conn, transportDetail string, wait time.Duration) (string, error) {
-	_ = conn.SetReadDeadline(time.Now().Add(wait))
+func assessServerBehaviorRaw(ctx context.Context, conn net.Conn, transportDetail string, wait time.Duration) (string, error) {
+	_ = setReadDeadlineFromContext(conn, ctx, wait)
 	buf := make([]byte, 1)
 	n, err := conn.Read(buf)
 	if n > 0 {
@@ -496,8 +543,8 @@ func assessServerBehaviorRaw(conn net.Conn, transportDetail string, wait time.Du
 	return fmt.Sprintf("%s behavior=read_error", transportDetail), fmt.Errorf("ошибка чтения после handshake: %w", err)
 }
 
-func assessServerBehaviorWS(conn net.Conn, transportDetail string, wait time.Duration) (string, error) {
-	data, err := wsReadFramePayload(conn, wait)
+func assessServerBehaviorWS(ctx context.Context, conn net.Conn, transportDetail string, wait time.Duration) (string, error) {
+	data, err := wsReadFramePayload(ctx, conn, wait)
 	if err == nil {
 		if len(data) > 0 {
 			return fmt.Sprintf("%s behavior=ws_data_received -> возможно OK", transportDetail), nil
@@ -530,7 +577,7 @@ func isConnResetErr(err error) bool {
 	return strings.Contains(s, "connection reset") || strings.Contains(s, "forcibly closed")
 }
 
-func dialVLESSTransport(cfg *VLESSConfig, checkCfg CheckConfig) (net.Conn, string, error) {
+func dialVLESSTransport(ctx context.Context, cfg *VLESSConfig, checkCfg CheckConfig) (net.Conn, string, error) {
 	address := net.JoinHostPort(cfg.Host, cfg.Port)
 	needsTLS := strings.EqualFold(cfg.Security, "tls") || strings.EqualFold(cfg.Security, "reality")
 
@@ -547,24 +594,32 @@ func dialVLESSTransport(cfg *VLESSConfig, checkCfg CheckConfig) (net.Conn, strin
 		if serverName == "" {
 			serverName = cfg.Host
 		}
-		d := &net.Dialer{Timeout: checkCfg.Timeout}
-		conn, err = tls.DialWithDialer(d, "tcp", address, &tls.Config{
+		ctxStage, cancel := context.WithTimeout(ctx, checkCfg.Timeout)
+		defer cancel()
+		d := &net.Dialer{}
+		rawConn, err2 := d.DialContext(ctxStage, "tcp", address)
+		if err2 != nil {
+			return nil, "", fmt.Errorf("не удалось установить TLS транспорт для VLESS: %w", err2)
+		}
+		tlsConn := tls.Client(rawConn, &tls.Config{
 			ServerName:         serverName,
 			InsecureSkipVerify: checkCfg.SkipTLSVerify,
 			MinVersion:         tls.VersionTLS12,
 		})
-		if err != nil {
-			return nil, "", fmt.Errorf("не удалось установить TLS транспорт для VLESS: %w", err)
+		if err2 := tlsConn.HandshakeContext(ctxStage); err2 != nil {
+			_ = rawConn.Close()
+			return nil, "", fmt.Errorf("не удалось установить TLS транспорт для VLESS: %w", err2)
 		}
+		conn = tlsConn
 	} else {
-		conn, err = dialTCP(address, checkCfg.Timeout)
+		conn, err = dialTCP(ctx, address, checkCfg.Timeout)
 		if err != nil {
 			return nil, "", fmt.Errorf("не удалось установить TCP транспорт для VLESS: %w", err)
 		}
 	}
 
 	if strings.EqualFold(cfg.Type, "ws") {
-		if err := performWSUpgrade(conn, cfg); err != nil {
+		if err := performWSUpgrade(ctx, conn, cfg, checkCfg.Timeout); err != nil {
 			_ = conn.Close()
 			return nil, "", err
 		}
@@ -574,7 +629,7 @@ func dialVLESSTransport(cfg *VLESSConfig, checkCfg CheckConfig) (net.Conn, strin
 	return conn, fmt.Sprintf("transport=tcp endpoint=%s", address), nil
 }
 
-func performWSUpgrade(conn net.Conn, cfg *VLESSConfig) error {
+func performWSUpgrade(ctx context.Context, conn net.Conn, cfg *VLESSConfig, timeout time.Duration) error {
 	wsPath := cfg.Path
 	if wsPath == "" {
 		wsPath = "/"
@@ -595,6 +650,7 @@ func performWSUpgrade(conn net.Conn, cfg *VLESSConfig) error {
 
 	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Protocol: vless\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n\r\n",
 		wsPath, hostHdr, key)
+	_ = setDeadlineFromContext(conn, ctx, timeout)
 	if _, err := io.WriteString(conn, req); err != nil {
 		return fmt.Errorf("ошибка отправки WS upgrade запроса: %w", err)
 	}
@@ -723,8 +779,8 @@ func wsWriteFrame(conn net.Conn, opcode byte, payload []byte) error {
 	return err
 }
 
-func wsReadFramePayload(conn net.Conn, timeout time.Duration) ([]byte, error) {
-	_ = conn.SetDeadline(time.Now().Add(timeout))
+func wsReadFramePayload(ctx context.Context, conn net.Conn, timeout time.Duration) ([]byte, error) {
+	_ = setDeadlineFromContext(conn, ctx, timeout)
 	first := make([]byte, 2)
 	if _, err := io.ReadFull(conn, first); err != nil {
 		return nil, err
@@ -768,6 +824,20 @@ func wsReadFramePayload(conn net.Conn, timeout time.Duration) ([]byte, error) {
 		}
 	}
 	return payload, nil
+}
+
+func setDeadlineFromContext(conn net.Conn, ctx context.Context, fallback time.Duration) error {
+	if dl, ok := ctx.Deadline(); ok {
+		return conn.SetDeadline(dl)
+	}
+	return conn.SetDeadline(time.Now().Add(fallback))
+}
+
+func setReadDeadlineFromContext(conn net.Conn, ctx context.Context, fallback time.Duration) error {
+	if dl, ok := ctx.Deadline(); ok {
+		return conn.SetReadDeadline(dl)
+	}
+	return conn.SetReadDeadline(time.Now().Add(fallback))
 }
 
 func decodeUUID(v string) ([]byte, error) {
