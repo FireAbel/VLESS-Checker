@@ -98,6 +98,17 @@ func main() {
 		XrayTimeout:     time.Duration(xrayTimeoutSec) * time.Second,
 	}
 
+	// Auto-bot mode: if no --config provided and a Telegram token exists,
+	// start the bot without requiring --bot.
+	if !botMode && strings.TrimSpace(configURL) == "" {
+		if strings.TrimSpace(telegramToken) == "" {
+			telegramToken = os.Getenv("TELEGRAM_BOT_TOKEN")
+		}
+		if strings.TrimSpace(telegramToken) != "" {
+			botMode = true
+		}
+	}
+
 	if botMode {
 		if telegramToken == "" {
 			telegramToken = os.Getenv("TELEGRAM_BOT_TOKEN")

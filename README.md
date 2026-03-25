@@ -23,21 +23,13 @@
 go run . --config "vless://UUID@example.com:443?security=tls&type=ws&path=%2Fws&sni=example.com&host=example.com"
 ```
 
-## Запуск бота
+## Запуск бота без лишних действий (run.bat)
 
-1. Создайте Telegram-бота через [@BotFather](https://t.me/BotFather) и получите токен.
-2. Запустите:
+1. Скопируйте `run.bat.example` в `run.bat`
+2. Откройте `run.bat` и вставьте токен в строку `set TELEGRAM_BOT_TOKEN=...`
+3. Запускайте бота двойным кликом по `run.bat`
 
-```bash
-go run . --bot --telegram-token "<TOKEN>"
-```
-
-или через переменную окружения:
-
-```bash
-set TELEGRAM_BOT_TOKEN=<TOKEN>
-go run . --bot
-```
+Важно: `run.bat` добавлен в `.gitignore`, чтобы токен не попал в Git.
 
 Бот понимает:
 - текст с `vless://...` ссылками (по одной или много)
