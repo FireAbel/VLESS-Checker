@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -214,6 +215,15 @@ func handleUpdate(client *http.Client, token, base string, up tgUpdate, checkCfg
 		return sendTelegramMessage(client, base, chatID, "Отправьте текст/файл с динамическим конфигом (vless://... или base64 подписка).")
 	}
 
+	// If user sends an URL to a hosted config/subscription, download it and include into input.
+	downloaded, hadURL, dlErr := downloadHTTPInputs(rawInput)
+	if hadURL && dlErr != nil {
+		return sendTelegramMessage(client, base, chatID, "Не удалось скачать конфиг по ссылке. Проверьте, что URL доступен без авторизации и отдает текст/base64.\nОшибка: "+dlErr.Error())
+	}
+	if strings.TrimSpace(downloaded) != "" {
+		rawInput += "\n" + downloaded
+	}
+
 	configs := ExtractVLESSConfigs(rawInput)
 	if len(configs) == 0 {
 		return sendTelegramMessage(client, base, chatID, "VLESS конфиги не найдены. Проверьте формат входных данных.")
@@ -417,6 +427,16 @@ func ExtractVLESSConfigs(input string) []string {
 	if decoded, ok := decodeSubscriptionMaybe(input); ok {
 		candidates = append(candidates, decoded)
 	}
+	// If the dynamic config is JSON, extract embedded strings and try to
+	// discover vless links / base64 payloads inside them.
+	if extracted, ok := extractStringsFromJSON(input); ok {
+		candidates = append(candidates, extracted...)
+		for _, s := range extracted {
+			if decoded, ok := decodeSubscriptionMaybe(s); ok {
+				candidates = append(candidates, decoded)
+			}
+		}
+	}
 
 	seen := map[string]struct{}{}
 	var out []string
@@ -434,6 +454,47 @@ func ExtractVLESSConfigs(input string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func extractStringsFromJSON(input string) ([]string, bool) {
+	trim := strings.TrimSpace(input)
+	if trim == "" {
+		return nil, false
+	}
+	// Cheap check to avoid attempting JSON parse on plain text.
+	if !(strings.HasPrefix(trim, "{") || strings.HasPrefix(trim, "[")) {
+		return nil, false
+	}
+	var v any
+	if err := json.Unmarshal([]byte(trim), &v); err != nil {
+		return nil, false
+	}
+	var out []string
+	collectStrings(v, &out)
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
+func collectStrings(v any, out *[]string) {
+	switch t := v.(type) {
+	case string:
+		s := strings.TrimSpace(t)
+		if s != "" {
+			*out = append(*out, s)
+		}
+	case []any:
+		for _, it := range t {
+			collectStrings(it, out)
+		}
+	case map[string]any:
+		for _, it := range t {
+			collectStrings(it, out)
+		}
+	default:
+		// ignore numbers/bools/null
+	}
 }
 
 func splitInputTokens(s string) []string {
@@ -479,6 +540,84 @@ func decodeSubscriptionMaybe(input string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+func downloadHTTPInputs(rawInput string) (downloaded string, hadURL bool, err error) {
+	urls := findHTTPURLs(rawInput)
+	if len(urls) == 0 {
+		return "", false, nil
+	}
+	hadURL = true
+
+	client := &http.Client{Timeout: 12 * time.Second}
+	var out []string
+	var errs []string
+	for _, u := range urls {
+		txt, e := downloadURLText(client, u, 2*1024*1024)
+		if e != nil {
+			errs = append(errs, fmt.Sprintf("%s -> %v", u, e))
+			continue
+		}
+		if strings.TrimSpace(txt) != "" {
+			out = append(out, txt)
+		}
+	}
+	if len(out) == 0 {
+		return "", true, fmt.Errorf("скачивание не удалось: %s", strings.Join(errs, " | "))
+	}
+	return strings.Join(out, "\n"), true, nil
+}
+
+func findHTTPURLs(rawInput string) []string {
+	tokens := splitInputTokens(rawInput)
+	urls := make([]string, 0, 4)
+	seen := map[string]struct{}{}
+	for _, t := range tokens {
+		lt := strings.ToLower(t)
+		if strings.HasPrefix(lt, "http://") || strings.HasPrefix(lt, "https://") {
+			if _, ok := seen[t]; ok {
+				continue
+			}
+			seen[t] = struct{}{}
+			urls = append(urls, t)
+			if len(urls) >= 5 {
+				break
+			}
+		}
+	}
+	return urls
+}
+
+func downloadURLText(client *http.Client, rawURL string, maxBytes int64) (string, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", errors.New("unsupported scheme")
+	}
+	// Remove URL fragment, it is not sent to server anyway.
+	parsed.Fragment = ""
+	rawURL = parsed.String()
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "vless-checker-bot/1.0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("status=%d", resp.StatusCode)
+	}
+	b, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes))
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }
 
 func downloadTelegramFileText(client *http.Client, token, fileID string) (string, error) {

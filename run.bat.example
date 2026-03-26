@@ -1,0 +1,9 @@
+@echo off
+REM 1) Copy this file to run.bat
+REM 2) Put your real Telegram bot token below
+REM 3) Run run.bat
+
+set TELEGRAM_BOT_TOKEN=PASTE_YOUR_TOKEN_HERE
+
+REM If your exe name differs, change it below:
+start "" "%~dp0vless-bot-autostart.exe"

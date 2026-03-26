@@ -3,3 +3,5 @@ dist/
 *.exe
 *.out
 *.test
+vless-checker-linux*
+run.bat
