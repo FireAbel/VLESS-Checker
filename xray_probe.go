@@ -16,15 +16,38 @@ import (
 	_ "github.com/xtls/xray-core/main/json"
 )
 
-func probeRealityVisionViaXray(ctx context.Context, cfg *VLESSConfig, checkCfg CheckConfig) (string, error) {
-	if stringsTrim(cfg.PBK) == "" {
-		return "", errors.New("reality: отсутствует pbk (public key) в ссылке")
+func probeVLESSViaXray(ctx context.Context, cfg *VLESSConfig, checkCfg CheckConfig) (string, error) {
+	sec := strings.ToLower(stringsTrim(cfg.Security))
+	if sec == "" {
+		sec = "none"
 	}
-	if stringsTrim(cfg.SNI) == "" {
-		return "", errors.New("reality: отсутствует sni в ссылке")
+	netType := strings.ToLower(stringsTrim(cfg.Type))
+	if netType == "" {
+		netType = "tcp"
 	}
-	if stringsTrim(cfg.FP) == "" {
-		return "", errors.New("reality: отсутствует fp (fingerprint) в ссылке")
+
+	switch sec {
+	case "none", "tls", "reality":
+	default:
+		return "", fmt.Errorf("xray-probe: unsupported security=%s", sec)
+	}
+	switch netType {
+	case "tcp", "ws":
+	default:
+		return "", fmt.Errorf("xray-probe: unsupported type=%s", netType)
+	}
+
+	// Reality needs extra parameters.
+	if sec == "reality" {
+		if stringsTrim(cfg.PBK) == "" {
+			return "", errors.New("reality: отсутствует pbk (public key) в ссылке")
+		}
+		if stringsTrim(cfg.SNI) == "" {
+			return "", errors.New("reality: отсутствует sni в ссылке")
+		}
+		if stringsTrim(cfg.FP) == "" {
+			return "", errors.New("reality: отсутствует fp (fingerprint) в ссылке")
+		}
 	}
 
 	probeURL := checkCfg.ProbeURL
@@ -47,7 +70,7 @@ func probeRealityVisionViaXray(ctx context.Context, cfg *VLESSConfig, checkCfg C
 		return "", err
 	}
 
-	confBytes, err := buildXrayClientJSON(cfg, port)
+	confBytes, err := buildXrayClientJSON(cfg, port, checkCfg.SkipTLSVerify)
 	if err != nil {
 		return "", err
 	}
@@ -73,19 +96,80 @@ func probeRealityVisionViaXray(ctx context.Context, cfg *VLESSConfig, checkCfg C
 	if err != nil {
 		return fmt.Sprintf("proxy=http://127.0.0.1:%d probe_url=%s dur=%s", port, probeURL, dur), classifyXrayProbeErr(err)
 	}
+	if status < 200 || status >= 400 {
+		return fmt.Sprintf("proxy=http://127.0.0.1:%d probe_url=%s status=%d dur=%s", port, probeURL, status, dur),
+			fmt.Errorf("HTTP probe вернул статус %d (ожидался 2xx/3xx) -> FAIL", status)
+	}
 
 	return fmt.Sprintf("proxy=http://127.0.0.1:%d probe_url=%s status=%d dur=%s", port, probeURL, status, dur), nil
 }
 
-func buildXrayClientJSON(v *VLESSConfig, localHTTPProxyPort int) ([]byte, error) {
+func buildXrayClientJSON(v *VLESSConfig, localHTTPProxyPort int, allowInsecureTLS bool) ([]byte, error) {
 	remotePort, err := parsePortInt(v.Port)
 	if err != nil {
 		return nil, err
 	}
 
+	security := strings.ToLower(stringsTrim(v.Security))
+	if security == "" {
+		security = "none"
+	}
+	network := strings.ToLower(stringsTrim(v.Type))
+	if network == "" {
+		network = "tcp"
+	}
+
+	stream := map[string]any{
+		"network":  network,
+		"security": security,
+	}
+	if network == "ws" {
+		wsPath := stringsTrim(v.Path)
+		if wsPath == "" {
+			wsPath = "/"
+		}
+		if !strings.HasPrefix(wsPath, "/") {
+			wsPath = "/" + wsPath
+		}
+		host := stringsTrim(v.HostHdr)
+		if host == "" {
+			host = v.Host
+		}
+		stream["wsSettings"] = map[string]any{
+			"path": wsPath,
+			"headers": map[string]any{
+				"Host": host,
+			},
+		}
+	}
+	if security == "tls" {
+		serverName := stringsTrim(v.SNI)
+		if serverName == "" {
+			serverName = v.Host
+		}
+		stream["tlsSettings"] = map[string]any{
+			"serverName":    serverName,
+			"allowInsecure": allowInsecureTLS,
+		}
+	}
+	if security == "reality" {
+		serverName := stringsTrim(v.SNI)
+		if serverName == "" {
+			serverName = v.Host
+		}
+		stream["realitySettings"] = map[string]any{
+			"serverName":   serverName,
+			"publicKey":    v.PBK,
+			"shortId":      stringsTrim(v.SID),
+			"fingerprint":  stringsTrim(v.FP),
+			"show":         false,
+			"spiderX":      "",
+		}
+	}
+
 	// Minimal JSON config. We keep logs off to avoid noise in bot mode.
 	// Inbound: local HTTP proxy.
-	// Outbound: vless reality vision.
+	// Outbound: vless (tcp/ws + none/tls/reality).
 	cfg := map[string]any{
 		"log": map[string]any{
 			"loglevel": "none",
@@ -122,16 +206,7 @@ func buildXrayClientJSON(v *VLESSConfig, localHTTPProxyPort int) ([]byte, error)
 						},
 					},
 				},
-				"streamSettings": map[string]any{
-					"network":  "tcp",
-					"security": "reality",
-					"realitySettings": map[string]any{
-						"serverName": v.SNI,
-						"publicKey":  v.PBK,
-						"shortId":    v.SID,
-						"fingerprint": v.FP,
-					},
-				},
+				"streamSettings": stream,
 			},
 			map[string]any{
 				"tag":      "direct",

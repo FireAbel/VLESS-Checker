@@ -222,20 +222,20 @@ func RunChecksCtx(ctx context.Context, raw string, cfg CheckConfig) ([]StageResu
 		}
 	}
 
-	if strings.EqualFold(parsed.Security, "reality") && strings.EqualFold(parsed.Flow, "xtls-rprx-vision") {
-		start = time.Now()
-		detail, xerr := probeRealityVisionViaXray(ctx, parsed, cfg)
-		results = append(results, stageFrom("xray_reality_vision_probe", start, xerr == nil, detail, xerr))
-		if xerr != nil {
-			return results, parsed
-		}
-	}
-
 	shouldTryWS := cfg.TryWSUpgrade && (strings.EqualFold(parsed.Type, "ws") || (parsed.Type == "" && cfg.PreferWebsocket))
 	if shouldTryWS {
 		start = time.Now()
 		wsDetail, wsErr := probeWebSocket(ctx, parsed, cfg)
 		results = append(results, stageFrom("ws_upgrade_probe", start, wsErr == nil, wsDetail, wsErr))
+	}
+
+	// The decisive check: real proxying via embedded xray-core. This prevents
+	// false positives where only DNS/TCP/TLS are OK but VLESS itself is not.
+	start = time.Now()
+	detail, xerr := probeVLESSViaXray(ctx, parsed, cfg)
+	results = append(results, stageFrom("xray_vless_proxy_probe", start, xerr == nil, detail, xerr))
+	if xerr != nil {
+		return results, parsed
 	}
 
 	return results, parsed
