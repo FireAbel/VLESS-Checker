@@ -6,12 +6,20 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
+)
+
+var (
+	outW io.Writer = os.Stdout
+	errW io.Writer = os.Stderr
 )
 
 type StageResult struct {
@@ -20,6 +28,12 @@ type StageResult struct {
 	Duration time.Duration
 	Detail   string
 	Err      error
+}
+
+type FailureInfo struct {
+	Stage  string
+	Code   string
+	Reason string
 }
 
 type CheckConfig struct {
@@ -52,6 +66,9 @@ type VLESSConfig struct {
 func main() {
 	var (
 		configURL        string
+		configURLHTTP    string
+		logFile          string
+		logDir           string
 		timeoutSec       int
 		skipTLSVerify    bool
 		tryWS            bool
@@ -67,9 +84,18 @@ func main() {
 		globalRPM        int
 		probeURL         string
 		xrayTimeoutSec   int
+		maxFromURL       int
+		dbDir            string
+		dbLogsDir        string
+		dbWorkers        int
+		dbMaxPerFile     int
+		dbFileDelaySec   int
 	)
 
 	flag.StringVar(&configURL, "config", "", "VLESS URL, e.g. vless://uuid@host:443?...")
+	flag.StringVar(&configURLHTTP, "config-url", "", "HTTP(S) URL that returns configs (text/base64/JSON containing vless://...)")
+	flag.StringVar(&logFile, "log-file", "", "write CLI output to this file (in addition to stdout)")
+	flag.StringVar(&logDir, "log-dir", "", "write CLI output to a timestamped file in this directory")
 	flag.IntVar(&timeoutSec, "timeout", 8, "stage timeout in seconds")
 	flag.BoolVar(&skipTLSVerify, "skip-tls-verify", true, "skip TLS certificate verification")
 	flag.BoolVar(&tryWS, "ws-probe", true, "attempt WebSocket HTTP upgrade probe for type=ws")
@@ -85,7 +111,22 @@ func main() {
 	flag.IntVar(&globalRPM, "global-rpm", 300, "global rate limit (checks per minute)")
 	flag.StringVar(&probeURL, "probe-url", "http://connectivitycheck.gstatic.com/generate_204", "HTTP probe URL for xray-based checks")
 	flag.IntVar(&xrayTimeoutSec, "xray-timeout", 30, "overall timeout for embedded xray probe stage in seconds")
+	flag.IntVar(&maxFromURL, "max-from-url", 25, "max configs to check when using --config-url")
+	flag.StringVar(&dbDir, "db-dir", "", "папка с файлами конфигов (.txt и др.): проверка всех файлов, лог на каждый в --db-logs-dir")
+	flag.StringVar(&dbLogsDir, "db-logs-dir", "", "куда писать логи (по умолчанию: <db-dir>/check_logs)")
+	flag.IntVar(&dbWorkers, "db-workers", 3, "параллельных воркеров для --db-dir (xray тяжёлый, не завышайте)")
+	flag.IntVar(&dbMaxPerFile, "db-max-per-file", 0, "макс. число vless из одного файла (0 = без лимита)")
+	flag.IntVar(&dbFileDelaySec, "db-file-delay-sec", 30, "задержка между файлами в --db-dir (сек; 0 = без задержки)")
 	flag.Parse()
+
+	logCloser, logErr := setupLogWriters(logFile, logDir)
+	if logErr != nil {
+		fmt.Fprintln(os.Stderr, "Ошибка логирования:", logErr)
+		os.Exit(2)
+	}
+	if logCloser != nil {
+		defer logCloser()
+	}
 
 	checkCfg := CheckConfig{
 		Timeout:         time.Duration(timeoutSec) * time.Second,
@@ -100,7 +141,7 @@ func main() {
 
 	// Auto-bot mode: if no --config provided and a Telegram token exists,
 	// start the bot without requiring --bot.
-	if !botMode && strings.TrimSpace(configURL) == "" {
+	if !botMode && strings.TrimSpace(configURL) == "" && strings.TrimSpace(configURLHTTP) == "" && strings.TrimSpace(dbDir) == "" {
 		if strings.TrimSpace(telegramToken) == "" {
 			telegramToken = os.Getenv("TELEGRAM_BOT_TOKEN")
 		}
@@ -114,7 +155,7 @@ func main() {
 			telegramToken = os.Getenv("TELEGRAM_BOT_TOKEN")
 		}
 		if telegramToken == "" {
-			fmt.Fprintln(os.Stderr, "Ошибка: в режиме --bot нужен --telegram-token или переменная TELEGRAM_BOT_TOKEN")
+			fmt.Fprintln(errW, "Ошибка: в режиме --bot нужен --telegram-token или переменная TELEGRAM_BOT_TOKEN")
 			os.Exit(2)
 		}
 		if maxConfigs < 1 {
@@ -145,20 +186,120 @@ func main() {
 			UserRPM:      userRPM,
 			GlobalRPM:    globalRPM,
 		}); err != nil {
-			fmt.Fprintf(os.Stderr, "Ошибка запуска бота: %v\n", err)
+			fmt.Fprintf(errW, "Ошибка запуска бота: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if strings.TrimSpace(configURLHTTP) != "" {
+		if maxFromURL < 1 {
+			maxFromURL = 1
+		}
+		text, err := downloadURLText(&http.Client{Timeout: 15 * time.Second}, configURLHTTP, 2*1024*1024)
+		if err != nil {
+			fmt.Fprintf(errW, "Ошибка: не удалось скачать --config-url: %v\n", err)
+			os.Exit(1)
+		}
+		configs := ExtractVLESSConfigs(text)
+		if len(configs) == 0 {
+			fmt.Fprintln(errW, "Ошибка: в ответе --config-url не найдено vless:// конфигов")
+			os.Exit(1)
+		}
+		if len(configs) > maxFromURL {
+			configs = configs[:maxFromURL]
+		}
+		failAny := false
+		statusLines := make([]string, 0, len(configs))
+		for i, u := range configs {
+			fmt.Fprintf(outW, "\n--- [%d/%d] %s ---\n", i+1, len(configs), u)
+			results, parsedCfg := RunChecks(u, checkCfg)
+			writeReport(outW, parsedCfg, results)
+			label := configLabelFromURL(u, i+1)
+			if hasFailure(results) {
+				failAny = true
+				fi, _ := failureInfoFromResults(results)
+				line := fmt.Sprintf("STATUS %s error code=%s stage=%s reason=%s", label, fi.Code, fi.Stage, fi.Reason)
+				statusLines = append(statusLines, line)
+				fmt.Fprintln(outW, line)
+			} else {
+				line := fmt.Sprintf("STATUS %s ok code=OK", label)
+				statusLines = append(statusLines, line)
+				fmt.Fprintln(outW, line)
+			}
+		}
+		sort.Strings(statusLines)
+		fmt.Fprintln(outW, "\n=== Unified Statuses (--config-url) ===")
+		for _, line := range statusLines {
+			fmt.Fprintln(outW, line)
+		}
+		if failAny {
+			os.Exit(1)
+		}
+		return
+	}
+
+	if strings.TrimSpace(dbDir) != "" {
+		logsDir := strings.TrimSpace(dbLogsDir)
+		if logsDir == "" {
+			logsDir = filepath.Join(dbDir, "check_logs")
+		}
+		if dbWorkers < 1 {
+			dbWorkers = 1
+		}
+		if dbFileDelaySec < 0 {
+			dbFileDelaySec = 0
+		}
+		summary, err := RunDbDirectory(
+			context.Background(),
+			dbDir,
+			logsDir,
+			checkCfg,
+			dbWorkers,
+			dbMaxPerFile,
+			time.Duration(dbFileDelaySec)*time.Second,
+		)
+		if err != nil {
+			fmt.Fprintf(errW, "Ошибка --db-dir: %v\n", err)
+			os.Exit(2)
+		}
+		okRate := 0.0
+		if summary.ConfigsTotal > 0 {
+			okRate = float64(summary.ConfigsOK) * 100 / float64(summary.ConfigsTotal)
+		}
+		fmt.Fprintf(outW, "\n=== db batch: готово ===\n"+
+			"файлов: всего %d, успешных %d, проблемных %d\n"+
+			"конфигов vless: проверено %d, успех %d, ошибка %d\n"+
+			"логи: %s\nсводка: %s\n"+
+			"\nКороткое саммари по проверенным конфигам:\n"+
+			"- Всего: %d\n"+
+			"- OK:    %d\n"+
+			"- FAIL:  %d\n"+
+			"- OK%%:   %.1f%%\n",
+			summary.FilesTotal, summary.FilesOK, summary.FilesProblem,
+			summary.ConfigsTotal, summary.ConfigsOK, summary.ConfigsFail,
+			logsDir, summary.SummaryPath,
+			summary.ConfigsTotal, summary.ConfigsOK, summary.ConfigsFail, okRate)
+		if summary.FilesProblem > 0 {
 			os.Exit(1)
 		}
 		return
 	}
 
 	if configURL == "" {
-		fmt.Fprintln(os.Stderr, "Ошибка: передайте VLESS-ссылку через --config или используйте --bot")
+		fmt.Fprintln(errW, "Ошибка: передайте VLESS-ссылку через --config, или --config-url, или --db-dir, или используйте --bot")
 		flag.Usage()
 		os.Exit(2)
 	}
 
 	results, parsedCfg := RunChecks(configURL, checkCfg)
-	printReport(parsedCfg, results)
+	writeReport(outW, parsedCfg, results)
+	label := configLabelFromURL(configURL, 1)
+	if fi, ok := failureInfoFromResults(results); ok {
+		fmt.Fprintf(outW, "STATUS %s error code=%s stage=%s reason=%s\n", label, fi.Code, fi.Stage, fi.Reason)
+	} else {
+		fmt.Fprintf(outW, "STATUS %s ok code=OK\n", label)
+	}
 
 	if hasFailure(results) {
 		os.Exit(1)
@@ -227,6 +368,20 @@ func RunChecksCtx(ctx context.Context, raw string, cfg CheckConfig) ([]StageResu
 		start = time.Now()
 		wsDetail, wsErr := probeWebSocket(ctx, parsed, cfg)
 		results = append(results, stageFrom("ws_upgrade_probe", start, wsErr == nil, wsDetail, wsErr))
+	}
+
+	netType := strings.ToLower(strings.TrimSpace(parsed.Type))
+	if netType == "" {
+		netType = "tcp"
+	}
+	if netType != "tcp" && netType != "ws" && netType != "xhttp" {
+		results = append(results, StageResult{
+			Name:     "xray_vless_proxy_probe_skipped",
+			Success:  true,
+			Duration: 0,
+			Detail:   fmt.Sprintf("type=%s пока не поддержан в embedded xray-probe; этап proxy-probe пропущен. Базовые DNS/TCP/TLS проверки пройдены.", netType),
+		})
+		return results, parsed
 	}
 
 	// The decisive check: real proxying via embedded xray-core. This prevents
@@ -392,34 +547,58 @@ func stageFrom(name string, start time.Time, success bool, detail string, err er
 	}
 }
 
-func printReport(cfg *VLESSConfig, results []StageResult) {
-	fmt.Println("=== VLESS Connectivity Report ===")
+func writeReport(w io.Writer, cfg *VLESSConfig, results []StageResult) {
+	fmt.Fprintln(w, "=== VLESS Connectivity Report ===")
 	if cfg != nil {
-		fmt.Println(configSummary(cfg))
+		fmt.Fprintln(w, configSummary(cfg))
 	}
-	fmt.Println()
+	fmt.Fprintln(w)
 
 	for _, r := range results {
 		status := "OK"
 		if !r.Success {
 			status = "FAIL"
 		}
-		fmt.Printf("[%s] %-18s %v\n", status, r.Name, r.Duration.Round(time.Millisecond))
+		fmt.Fprintf(w, "[%s] %-18s %v\n", status, r.Name, r.Duration.Round(time.Millisecond))
 		if r.Detail != "" {
-			fmt.Printf("  detail: %s\n", r.Detail)
+			fmt.Fprintf(w, "  detail: %s\n", r.Detail)
 		}
 		if r.Err != nil {
-			fmt.Printf("  error : %v\n", r.Err)
+			fmt.Fprintf(w, "  error : %v\n", r.Err)
 		}
 	}
 
 	if fail := firstFailure(results); fail != nil {
-		fmt.Println()
-		fmt.Printf("Итог: проблема возникает на этапе `%s`\n", fail.Name)
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "Итог: проблема возникает на этапе `%s`\n", fail.Name)
 	} else {
-		fmt.Println()
-		fmt.Println("Итог: базовая доступность подтверждена (все этапы успешны).")
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "Итог: базовая доступность подтверждена (все этапы успешны).")
 	}
+}
+
+func setupLogWriters(logFile, logDir string) (func() error, error) {
+	logFile = strings.TrimSpace(logFile)
+	logDir = strings.TrimSpace(logDir)
+	if logFile != "" && logDir != "" {
+		return nil, errors.New("используйте только один из флагов: --log-file или --log-dir")
+	}
+	if logFile == "" && logDir == "" {
+		return nil, nil
+	}
+	if logDir != "" {
+		if err := os.MkdirAll(logDir, 0o755); err != nil {
+			return nil, err
+		}
+		logFile = filepath.Join(logDir, "run_"+time.Now().Format("20060102_150405")+".log")
+	}
+	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	outW = io.MultiWriter(os.Stdout, f)
+	errW = io.MultiWriter(os.Stderr, f)
+	return f.Close, nil
 }
 
 func configSummary(cfg *VLESSConfig) string {
@@ -447,6 +626,52 @@ func firstFailure(results []StageResult) *StageResult {
 	return nil
 }
 
+func failureInfoFromResults(results []StageResult) (FailureInfo, bool) {
+	fail := firstFailure(results)
+	if fail == nil {
+		return FailureInfo{}, false
+	}
+	return normalizeFailure(fail.Name, fail.Err, fail.Detail), true
+}
+
+func normalizeFailure(stage string, err error, detail string) FailureInfo {
+	src := strings.ToLower(strings.TrimSpace(detail))
+	if err != nil {
+		src = strings.ToLower(strings.TrimSpace(err.Error() + " | " + detail))
+	}
+	code := "UNKNOWN"
+	reason := "неизвестная ошибка"
+	switch {
+	case strings.Contains(src, "no such host"):
+		code, reason = "DNS_RESOLVE_FAILED", "домен не резолвится (DNS)"
+	case strings.Contains(src, "connection refused"):
+		code, reason = "TCP_CONNECTION_REFUSED", "порт закрыт (connection refused)"
+	case strings.Contains(src, "i/o timeout"), strings.Contains(src, "context deadline exceeded"), strings.Contains(src, "timeout"):
+		code, reason = "NETWORK_TIMEOUT", "таймаут сети/ответа"
+	case strings.Contains(src, "connection reset"), strings.Contains(src, "forcibly closed"):
+		code, reason = "CONNECTION_RESET", "соединение сброшено сервером"
+	case strings.Contains(src, "tls"), strings.Contains(src, "handshake"):
+		code, reason = "TLS_HANDSHAKE_FAILED", "ошибка TLS/Reality рукопожатия"
+	case strings.Contains(src, "status=503"), strings.Contains(src, "получено 503"):
+		code, reason = "PROBE_HTTP_503", "через прокси получен HTTP 503 на probe-url"
+	case strings.Contains(src, "generate_204"), strings.Contains(src, "ожидался http 204"):
+		code, reason = "PROBE_EXPECTED_204", "ожидался HTTP 204 на generate_204"
+	case strings.Contains(src, "http probe вернул статус"):
+		code, reason = "PROBE_HTTP_STATUS_BAD", "неподходящий HTTP-статус probe-url"
+	case strings.Contains(src, "unsupported type"):
+		code, reason = "UNSUPPORTED_TYPE", "неподдерживаемый тип транспорта"
+	case strings.Contains(src, "unsupported security"):
+		code, reason = "UNSUPPORTED_SECURITY", "неподдерживаемый security"
+	case strings.Contains(src, "uuid"):
+		code, reason = "INVALID_UUID", "некорректный UUID"
+	}
+	return FailureInfo{
+		Stage:  stage,
+		Code:   code,
+		Reason: reason,
+	}
+}
+
 func hasFailure(results []StageResult) bool {
 	return firstFailure(results) != nil
 }
@@ -456,6 +681,27 @@ func emptyAsDash(v string) string {
 		return "-"
 	}
 	return v
+}
+
+func configLabelFromURL(link string, idx int) string {
+	u, err := url.Parse(strings.TrimSpace(link))
+	if err != nil {
+		return fmt.Sprintf("#config-%d", idx)
+	}
+	frag := strings.TrimSpace(u.Fragment)
+	if frag == "" {
+		return fmt.Sprintf("#config-%d", idx)
+	}
+	if dec, err := url.QueryUnescape(frag); err == nil {
+		frag = strings.TrimSpace(dec)
+	}
+	if frag == "" {
+		return fmt.Sprintf("#config-%d", idx)
+	}
+	if strings.HasPrefix(frag, "#") {
+		return frag
+	}
+	return "#" + frag
 }
 
 func tlsVersionName(v uint16) string {

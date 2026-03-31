@@ -32,7 +32,7 @@ func probeVLESSViaXray(ctx context.Context, cfg *VLESSConfig, checkCfg CheckConf
 		return "", fmt.Errorf("xray-probe: unsupported security=%s", sec)
 	}
 	switch netType {
-	case "tcp", "ws":
+	case "tcp", "ws", "xhttp":
 	default:
 		return "", fmt.Errorf("xray-probe: unsupported type=%s", netType)
 	}
@@ -96,12 +96,48 @@ func probeVLESSViaXray(ctx context.Context, cfg *VLESSConfig, checkCfg CheckConf
 	if err != nil {
 		return fmt.Sprintf("proxy=http://127.0.0.1:%d probe_url=%s dur=%s", port, probeURL, dur), classifyXrayProbeErr(err)
 	}
+	if probeExpectsGenerate204(probeURL) && status != http.StatusNoContent {
+		return fmt.Sprintf("proxy=http://127.0.0.1:%d probe_url=%s status=%d dur=%s", port, probeURL, status, dur),
+			fmt.Errorf("для generate_204 ожидался HTTP 204, получено %d — часто это captive portal/подмена ответа, а не рабочий выход в интернет через VLESS", status)
+	}
 	if status < 200 || status >= 400 {
 		return fmt.Sprintf("proxy=http://127.0.0.1:%d probe_url=%s status=%d dur=%s", port, probeURL, status, dur),
 			fmt.Errorf("HTTP probe вернул статус %d (ожидался 2xx/3xx) -> FAIL", status)
 	}
 
 	return fmt.Sprintf("proxy=http://127.0.0.1:%d probe_url=%s status=%d dur=%s", port, probeURL, status, dur), nil
+}
+
+// probeExpectsGenerate204: стандартные connectivity-check URL (Google) должны отвечать ровно 204.
+// Любой 200/302 с «логином» провайдера иначе давал ложный OK.
+func probeExpectsGenerate204(rawURL string) bool {
+	u, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || u.Host == "" {
+		return false
+	}
+	path := strings.ToLower(u.Path)
+	if !strings.Contains(path, "generate_204") {
+		return false
+	}
+	h := strings.ToLower(u.Hostname())
+	if strings.HasSuffix(h, ".gstatic.com") {
+		return true
+	}
+	if h == "google.com" || strings.HasSuffix(h, ".google.com") {
+		return true
+	}
+	return false
+}
+
+func buildVLESSUserJSON(uuid, flow string) map[string]any {
+	u := map[string]any{
+		"id":         uuid,
+		"encryption": "none",
+	}
+	if stringsTrim(flow) != "" {
+		u["flow"] = flow
+	}
+	return u
 }
 
 func buildXrayClientJSON(v *VLESSConfig, localHTTPProxyPort int, allowInsecureTLS bool) ([]byte, error) {
@@ -142,6 +178,28 @@ func buildXrayClientJSON(v *VLESSConfig, localHTTPProxyPort int, allowInsecureTL
 			},
 		}
 	}
+	if network == "xhttp" {
+		xhttpPath := stringsTrim(v.Path)
+		if xhttpPath == "" {
+			xhttpPath = "/"
+		}
+		if !strings.HasPrefix(xhttpPath, "/") {
+			xhttpPath = "/" + xhttpPath
+		}
+		host := stringsTrim(v.HostHdr)
+		if host == "" {
+			// Для xhttp предпочтительнее SNI, затем host из ссылки.
+			host = stringsTrim(v.SNI)
+		}
+		if host == "" {
+			host = v.Host
+		}
+		stream["xhttpSettings"] = map[string]any{
+			"path": xhttpPath,
+			"host": host,
+			"mode": "auto",
+		}
+	}
 	if security == "tls" {
 		serverName := stringsTrim(v.SNI)
 		if serverName == "" {
@@ -169,7 +227,7 @@ func buildXrayClientJSON(v *VLESSConfig, localHTTPProxyPort int, allowInsecureTL
 
 	// Minimal JSON config. We keep logs off to avoid noise in bot mode.
 	// Inbound: local HTTP proxy.
-	// Outbound: vless (tcp/ws + none/tls/reality).
+	// Outbound: vless (tcp/ws/xhttp + none/tls/reality).
 	cfg := map[string]any{
 		"log": map[string]any{
 			"loglevel": "none",
@@ -197,11 +255,7 @@ func buildXrayClientJSON(v *VLESSConfig, localHTTPProxyPort int, allowInsecureTL
 							"address": v.Host,
 							"port":    remotePort,
 							"users": []any{
-								map[string]any{
-									"id":         v.UUID,
-									"encryption": "none",
-									"flow":       v.Flow,
-								},
+								buildVLESSUserJSON(v.UUID, v.Flow),
 							},
 						},
 					},

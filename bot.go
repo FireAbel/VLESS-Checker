@@ -260,8 +260,10 @@ func handleUpdate(client *http.Client, token, base string, up tgUpdate, checkCfg
 
 type cfgResult struct {
 	Idx    int
+	Label  string
 	Target string
 	OK     bool
+	Code   string
 	Stage  string
 	Reason string
 }
@@ -356,11 +358,10 @@ BUILD:
 	for _, r := range collected {
 		if r.OK {
 			okCount++
-			lines = append(lines, fmt.Sprintf("%d) ✅ WORKS — %s", r.Idx+1, r.Target))
+			lines = append(lines, fmt.Sprintf("%d) STATUS %s ok code=OK target=%s", r.Idx+1, r.Label, r.Target))
 			continue
 		}
-		lines = append(lines, fmt.Sprintf("%d) ❌ FAIL — %s", r.Idx+1, r.Target))
-		lines = append(lines, fmt.Sprintf("   этап: %s; причина: %s", r.Stage, r.Reason))
+		lines = append(lines, fmt.Sprintf("%d) STATUS %s error code=%s stage=%s reason=%s target=%s", r.Idx+1, r.Label, r.Code, r.Stage, r.Reason, r.Target))
 	}
 	header := fmt.Sprintf("Итог: %d/%d работает. Проверено %d/%d.", okCount, len(collected), len(collected), len(configs))
 	return ensureTelegramLimit(header + "\n\n" + strings.Join(lines, "\n")), len(collected) == len(configs)
@@ -368,22 +369,24 @@ BUILD:
 
 func checkOneConfig(ctx context.Context, idx int, cfgURL string, checkCfg CheckConfig) cfgResult {
 	results, parsed := RunChecksCtx(ctx, cfgURL, checkCfg)
-	fail := firstFailure(results)
+	label := configLabelFromURL(cfgURL, idx+1)
+	failInfo, hasFail := failureInfoFromResults(results)
 	target := cfgURL
 	if parsed != nil {
 		target = fmt.Sprintf("%s:%s (%s)", parsed.Host, parsed.Port, parsed.Type)
 	}
-	if fail == nil {
-		return cfgResult{Idx: idx, Target: target, OK: true}
+	if !hasFail {
+		return cfgResult{Idx: idx, Label: label, Target: target, OK: true, Code: "OK"}
 	}
-	reason := shortReason(fail.Err)
-	if reason == "" {
-		reason = shortReasonText(fail.Detail)
+	return cfgResult{
+		Idx:    idx,
+		Label:  label,
+		Target: target,
+		OK:     false,
+		Code:   failInfo.Code,
+		Stage:  failInfo.Stage,
+		Reason: failInfo.Reason,
 	}
-	if reason == "" {
-		reason = "неизвестная причина"
-	}
-	return cfgResult{Idx: idx, Target: target, OK: false, Stage: fail.Name, Reason: reason}
 }
 
 func shortReason(err error) string {

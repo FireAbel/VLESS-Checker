@@ -5,3 +5,4 @@ dist/
 *.test
 vless-checker-linux*
 run.bat
+check_url.bat
